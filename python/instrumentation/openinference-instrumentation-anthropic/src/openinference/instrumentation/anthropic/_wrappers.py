@@ -4,6 +4,7 @@ import logging
 from abc import ABC
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar, Token
+from functools import partial
 from itertools import chain
 from types import TracebackType
 from typing import (
@@ -17,6 +18,7 @@ from typing import (
     Tuple,
     Type,
 )
+from weakref import WeakSet
 
 import opentelemetry.context as context_api
 from opentelemetry import trace as trace_api
@@ -27,11 +29,13 @@ from wrapt import ObjectProxy
 from openinference.instrumentation import (
     TraceConfig,
     get_attributes_from_context,
+    get_current_trace_config,
     safe_json_dumps,
 )
 from openinference.instrumentation.anthropic._content import (
     _attributes_or_nothing,
     _dump_json,
+    _get,
     _get_message_contents_attributes,
     _get_metadata_attributes,
     _get_offered_tools,
@@ -42,6 +46,7 @@ from openinference.instrumentation.anthropic._content import (
     _to_json,
     _to_jsonable,
 )
+from openinference.instrumentation.anthropic._sdk_spans import _sending_request_of
 from openinference.instrumentation.anthropic._stream import (
     _MessagesStream,
     _RawStreamInterceptor,
@@ -181,6 +186,10 @@ class _WithTracer(ABC):
     Base class for wrappers that need a tracer.
     """
 
+    # every wrapper made, so uninstrument() can turn off the ones the SDK
+    # keeps in cached accessors like client.messages.with_raw_response
+    _instances: WeakSet[_WithTracer] = WeakSet()
+
     def __init__(
         self,
         tracer: trace_api.Tracer,
@@ -194,15 +203,24 @@ class _WithTracer(ABC):
         self._span_name = span_name
         # the trace config, for the attributes that the tracer's masking does not cover
         self._config = config or TraceConfig()
+        self._active = True
+        _WithTracer._instances.add(self)
 
-    def _get_attributes_from_request(
-        self, kwargs: Mapping[str, Any]
-    ) -> Iterator[Tuple[str, AttributeValue]]:
-        return _get_attributes_from_messages_create(kwargs, config=self._config)
+    def _current_config(self) -> TraceConfig:
+        # resolved once per call, at span start, so that the whole span (including a stream
+        # that finishes later) uses any using_trace_config override active at that point
+        return get_current_trace_config(self._config)
+
+    @staticmethod
+    def _params(kwargs: Mapping[str, Any], config: TraceConfig) -> _Params:
+        return _Params(
+            kwargs, get_attributes=partial(_get_attributes_from_messages_create, config=config)
+        )
 
     @contextmanager
     def _start_as_current_span(
         self,
+        config: TraceConfig,
         attributes: Optional[Mapping[str, Any]] = None,
         params: AbstractContextManager[Iterable[Tuple[str, AttributeValue]]] = nullcontext(()),
     ) -> Iterator[_WithSpan]:
@@ -216,19 +234,12 @@ class _WithTracer(ABC):
         except Exception:
             span = INVALID_SPAN
         with ExitStack() as stack:
-            stack.enter_context(
-                trace_api.use_span(
-                    span,
-                    end_on_exit=False,
-                    record_exception=False,
-                    set_status_on_exception=False,
-                )
-            )
+            stack.enter_context(_sending_request_of(span))
             yield _WithSpan(
                 span=span,
                 params=stack.enter_context(params),
                 context_metadata=(attributes or {}).get(METADATA),
-                config=self._config,
+                config=config,
             )
 
 
@@ -267,11 +278,13 @@ class _MessagesWrapper(_WithTracer):
         args: Tuple[Any, ...],
         kwargs: Mapping[str, Any],
     ) -> Any:
-        if context_api.get_value(context_api._SUPPRESS_INSTRUMENTATION_KEY):
+        if not self._active or context_api.get_value(context_api._SUPPRESS_INSTRUMENTATION_KEY):
             return wrapped(*args, **kwargs)
 
+        config = self._current_config()
         with self._start_as_current_span(
-            params=_Params(kwargs, get_attributes=self._get_attributes_from_request),
+            config,
+            params=self._params(kwargs, config),
             attributes=dict(
                 chain(
                     get_attributes_from_context(),
@@ -314,11 +327,13 @@ class _AsyncMessagesWrapper(_WithTracer):
         args: Tuple[Any, ...],
         kwargs: Mapping[str, Any],
     ) -> Any:
-        if context_api.get_value(context_api._SUPPRESS_INSTRUMENTATION_KEY):
+        if not self._active or context_api.get_value(context_api._SUPPRESS_INSTRUMENTATION_KEY):
             return await wrapped(*args, **kwargs)
 
+        config = self._current_config()
         with self._start_as_current_span(
-            params=_Params(kwargs, get_attributes=self._get_attributes_from_request),
+            config,
+            params=self._params(kwargs, config),
             attributes=dict(
                 chain(
                     get_attributes_from_context(),
@@ -379,11 +394,13 @@ class _CountTokensWrapper(_WithTracer):
         args: Tuple[Any, ...],
         kwargs: Mapping[str, Any],
     ) -> Any:
-        if context_api.get_value(context_api._SUPPRESS_INSTRUMENTATION_KEY):
+        if not self._active or context_api.get_value(context_api._SUPPRESS_INSTRUMENTATION_KEY):
             return wrapped(*args, **kwargs)
 
+        config = self._current_config()
         with self._start_as_current_span(
-            params=_Params(kwargs, get_attributes=self._get_attributes_from_request),
+            config,
+            params=self._params(kwargs, config),
             attributes=dict(
                 chain(
                     _get_llm_provider(instance),
@@ -421,11 +438,13 @@ class _AsyncCountTokensWrapper(_WithTracer):
         args: Tuple[Any, ...],
         kwargs: Mapping[str, Any],
     ) -> Any:
-        if context_api.get_value(context_api._SUPPRESS_INSTRUMENTATION_KEY):
+        if not self._active or context_api.get_value(context_api._SUPPRESS_INSTRUMENTATION_KEY):
             return await wrapped(*args, **kwargs)
 
+        config = self._current_config()
         with self._start_as_current_span(
-            params=_Params(kwargs, get_attributes=self._get_attributes_from_request),
+            config,
+            params=self._params(kwargs, config),
             attributes=dict(
                 chain(
                     _get_llm_provider(instance),
@@ -562,11 +581,13 @@ class _MessagesStreamWrapper(_WithTracer):
         args: Tuple[Any, ...],
         kwargs: Mapping[str, Any],
     ) -> Any:
-        if context_api.get_value(context_api._SUPPRESS_INSTRUMENTATION_KEY):
+        if not self._active or context_api.get_value(context_api._SUPPRESS_INSTRUMENTATION_KEY):
             return wrapped(*args, **kwargs)
 
-        params = _Params(kwargs, get_attributes=self._get_attributes_from_request)
+        config = self._current_config()
+        params = self._params(kwargs, config)
         with self._start_as_current_span(
+            config,
             params=params,
             attributes=dict(
                 chain(
@@ -606,11 +627,13 @@ class _AsyncMessagesStreamWrapper(_WithTracer):
         args: Tuple[Any, ...],
         kwargs: Mapping[str, Any],
     ) -> Any:
-        if context_api.get_value(context_api._SUPPRESS_INSTRUMENTATION_KEY):
+        if not self._active or context_api.get_value(context_api._SUPPRESS_INSTRUMENTATION_KEY):
             return wrapped(*args, **kwargs)
 
-        params = _Params(kwargs, get_attributes=self._get_attributes_from_request)
+        config = self._current_config()
+        params = self._params(kwargs, config)
         with self._start_as_current_span(
+            config,
             params=params,
             attributes=dict(
                 chain(
@@ -657,8 +680,8 @@ class _MessageStreamManager(ObjectProxy):  # type: ignore[misc,name-defined,type
         try:
             # the request is sent here, after stream() has returned, and anthropic>=1.8.0
             # prepares its body here, so the params are made current again for the body
-            # preparation wrapper
-            with self._self_params:
+            # preparation wrapper, and the span is made current for the request, see _sdk_spans
+            with self._self_params, _sending_request_of(self._self_with_span.span):
                 message_stream = self.__wrapped__.__enter__()
         except BaseException as exception:
             # a failed request never reaches __exit__, so the span has to be finished here
@@ -707,8 +730,8 @@ class _BetaMessageStreamManager(ObjectProxy):  # type: ignore[misc,name-defined,
         try:
             # the request is sent here, after stream() has returned, and anthropic>=1.8.0
             # prepares its body here, so the params are made current again for the body
-            # preparation wrapper
-            with self._self_params:
+            # preparation wrapper, and the span is made current for the request, see _sdk_spans
+            with self._self_params, _sending_request_of(self._self_with_span.span):
                 message_stream = self.__wrapped__.__enter__()
         except BaseException as exception:
             # a failed request never reaches __exit__, so the span has to be finished here
@@ -760,8 +783,8 @@ class _AsyncMessageStreamManager(ObjectProxy):  # type: ignore[misc,name-defined
         try:
             # the request is sent here, after stream() has returned, and anthropic>=1.8.0
             # prepares its body here, so the params are made current again for the body
-            # preparation wrapper
-            with self._self_params:
+            # preparation wrapper, and the span is made current for the request, see _sdk_spans
+            with self._self_params, _sending_request_of(self._self_with_span.span):
                 message_stream = await self.__wrapped__.__aenter__()
         except BaseException as exception:
             # a failed request never reaches __exit__, so the span has to be finished here
@@ -810,8 +833,8 @@ class _BetaAsyncMessageStreamManager(ObjectProxy):  # type: ignore[misc,name-def
         try:
             # the request is sent here, after stream() has returned, and anthropic>=1.8.0
             # prepares its body here, so the params are made current again for the body
-            # preparation wrapper
-            with self._self_params:
+            # preparation wrapper, and the span is made current for the request, see _sdk_spans
+            with self._self_params, _sending_request_of(self._self_with_span.span):
                 message_stream = await self.__wrapped__.__aenter__()
         except BaseException as exception:
             # a failed request never reaches __exit__, so the span has to be finished here
@@ -941,9 +964,32 @@ def _get_llm_input_messages(
     """
     if system:
         yield from _attributes_or_nothing(_get_llm_input_system_message, system, hide_images)
-    start = 1 if system else 0
-    for i, message in enumerate(messages, start=start):
+    i = 1 if system else 0
+    for message in messages:
+        content = _get(message, "content")
+        blocks = (
+            list(content) if not isinstance(content, str) and isinstance(content, Iterable) else []
+        )
+        if blocks:
+            # Reuse the materialized content so one-shot SDK iterables are not consumed twice.
+            message = message.copy()
+            message["content"] = blocks
+        tool_results = [block for block in blocks if _get(block, "type") == "tool_result"]
+        # Each result needs its own message so parallel tool results cannot overwrite one another.
+        # Anthropic requires tool results before the remaining content of a user message.
+        for block in tool_results:
+            yield f"{LLM_INPUT_MESSAGES}.{i}.{MESSAGE_ROLE}", "tool"
+            yield from _get_message_contents_attributes(
+                f"{LLM_INPUT_MESSAGES}.{i}", [block], hide_images
+            )
+            i += 1
+        if tool_results:
+            remaining = [block for block in blocks if _get(block, "type") != "tool_result"]
+            if not remaining:
+                continue
+            message["content"] = remaining
         yield from _attributes_or_nothing(_get_llm_input_message, i, message, hide_images)
+        i += 1
 
 
 def _get_llm_input_system_message(

@@ -168,3 +168,31 @@ tracer_provider = ...
 # This example uses the OpenAIInstrumentor, but it works with any of our auto instrumentors
 OpenAIInstrumentor().instrument(tracer_provider=tracer_provider, config=config)
 ```
+
+### Overriding the configuration for a scope
+
+`using_trace_config` overrides `TraceConfig` fields for spans started within its scope, for example to hide content for some requests only. It works as a context manager or a decorator, for sync and async code. Only the fields you pass change; all other fields keep the instrumentor's value. Nested blocks merge on top of the enclosing block.
+
+```python
+from openinference.instrumentation import using_trace_config
+
+with using_trace_config(hide_inputs=True, hide_outputs=True):
+    client.chat.completions.create(...)
+
+@using_trace_config(hide_inputs=True)
+async def handle_sensitive_request(...):
+    ...
+```
+
+The config is resolved when a span starts and applies to everything recorded on that span, so streamed responses that finish after the block exits are still covered.
+
+The override is stored in the OpenTelemetry context. Threads started inside the block, such as `ThreadPoolExecutor` workers, don't inherit it, and spans created there use the instrumentor's config. Propagate the context explicitly when you need the override there:
+
+```python
+import contextvars
+
+with using_trace_config(hide_inputs=True):
+    executor.submit(contextvars.copy_context().run, call_llm, prompt)
+```
+
+Instrumentation authors: call `get_current_trace_config(config)` when a span starts and use the result for every content decision on that span, instead of the config passed to `instrument()`.
