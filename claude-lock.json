@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "origin": {
+    "base_url": "https://api.anthropic.com"
+  },
+  "resources": {}
+}
