@@ -25,7 +25,9 @@ from opentelemetry.util.types import AttributeValue
 from typing_extensions import TypeAlias
 
 from openinference.instrumentation import (
+    TraceConfig,
     get_attributes_from_context,
+    get_current_trace_config,
     infer_llm_provider_from_host,
 )
 from openinference.instrumentation.openai._image_utils import (
@@ -51,6 +53,7 @@ from openinference.instrumentation.openai._utils import (
     _finish_tracing,
     _get_decision_type,
     _io_value_and_type,
+    _without_generated_image_results,
 )
 from openinference.instrumentation.openai._with_span import _WithSpan
 from openinference.semconv.trace import (
@@ -74,6 +77,11 @@ class _WithTracer(ABC):
     def __init__(self, tracer: trace_api.Tracer, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._tracer = tracer
+
+    def _current_trace_config(self) -> Optional[TraceConfig]:
+        """The tracer's config with any active ``using_trace_config`` override applied."""
+        config = getattr(self._tracer, "_self_config", None)
+        return get_current_trace_config(config) if isinstance(config, TraceConfig) else None
 
     @contextmanager
     def _start_as_current_span(
@@ -204,8 +212,8 @@ class _WithOpenAI(ABC):
         try:
             # Get the configuration from the tracer to check image hiding settings
             if TYPE_CHECKING:
-                assert hasattr(self, "_tracer")
-            config = getattr(getattr(self, "_tracer", None), "_self_config", None)
+                assert isinstance(self, _WithTracer)
+            config = self._current_trace_config()
 
             # Apply image redaction if configured
             hide_inputs = bool(config and getattr(config, "hide_inputs", False))
@@ -222,7 +230,9 @@ class _WithOpenAI(ABC):
             else:
                 processed_params = dict(request_parameters)
 
-            yield from _as_input_attributes(_io_value_and_type(processed_params))
+            yield from _as_input_attributes(
+                _io_value_and_type(_without_generated_image_results(processed_params))
+            )
             if (
                 extract_image_files
                 and cast_to is self._openai.types.ImagesResponse
@@ -433,7 +443,7 @@ class _AsyncRequest(_WithTracer, _WithOpenAI):
             logger.exception("Failed to parse request args")
             return await wrapped(*args, **kwargs)
         image_file_attributes: Optional[Tuple[Tuple[str, AttributeValue], ...]] = None
-        config = getattr(self._tracer, "_self_config", None)
+        config = self._current_trace_config()
         if cast_to is self._openai.types.ImagesResponse and not (
             config
             and (
